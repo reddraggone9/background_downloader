@@ -634,6 +634,10 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
         uriUtilsChannel.setMethodCallHandler(UriUtilsMethodCallHelper(this))
         val prefs = PreferenceManager.getDefaultSharedPreferences(applicationContext)
         requireWifi = RequireWiFi.entries[prefs.getInt(keyRequireWiFi, 0)]
+        // Plezy Vex fork: clear running notifications left behind by runs that ended
+        defaultScope.launch {
+            NotificationService.removeOrphanedRunningNotifications(applicationContext)
+        }
         // Clear expired items on a background dispatcher to avoid blocking the main thread
         defaultScope.launch {
             val workManager = WorkManager.getInstance(applicationContext)

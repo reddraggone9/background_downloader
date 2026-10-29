@@ -1,9 +1,11 @@
 package com.bbflight.background_downloader
 
+import android.app.ActivityManager
 import android.app.job.JobParameters
 import android.content.Context
 import android.content.SharedPreferences
 import android.os.Build
+import android.os.PowerManager
 import android.util.Log
 import androidx.preference.PreferenceManager
 import kotlinx.coroutines.CancellationException
@@ -132,6 +134,33 @@ open class TaskRunner(
 
         const val taskTimeoutMillis = 9 * 60 * 1000L  // 9 minutes
         const val expeditedTaskTimeoutMillis = 2 * 60 * 1000L  // 2 minutes
+
+        // Plezy Vex fork: refresh interval of an unknown-length, non-pausable run's
+        // notification, and how long that notification outlives its last refresh
+        const val unknownLengthRefreshMillis = 60 * 1000L
+        const val unknownLengthNotificationTimeoutMillis = 3 * 60 * 1000L
+
+        /**
+         * Plezy Vex fork: whether Android lets the app start a foreground service now. From
+         * the background (Android 12+) it refuses, and WorkManager, which has already moved the
+         * worker to its foreground set by then, ignores the platform's later stop of the job:
+         * the run keeps going without its job, loses network and fails, and the next queued
+         * task starts in its place. A run therefore only asks when it would be granted: the
+         * app is visible, or exempt from battery optimization. A run that did not ask is
+         * stopped cleanly by the platform and runs again.
+         */
+        fun foregroundStartAllowed(context: Context): Boolean {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return true
+            val power = context.getSystemService(PowerManager::class.java)
+            if (power?.isIgnoringBatteryOptimizations(context.packageName) == true) return true
+            val state = ActivityManager.RunningAppProcessInfo()
+            ActivityManager.getMyMemoryState(state)
+            return state.importance == ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND ||
+                    state.importance == ActivityManager.RunningAppProcessInfo.IMPORTANCE_VISIBLE
+        }
+
+        /** Plezy Vex fork: notification ids of the runs alive in this process */
+        val liveNotificationIds: MutableSet<Int> = java.util.concurrent.ConcurrentHashMap.newKeySet()
 
         /** Converts [Task] to JSON string representation */
         fun taskToJsonString(task: Task): String {
@@ -483,9 +512,11 @@ open class TaskRunner(
         // A run the platform stopped may still be unwinding: wait for it, so this run never
         // writes alongside it and sees where it left the partial file
         val turn = RunHandoff.awaitTurn(taskId)
+        liveNotificationIds.add(taskId.hashCode())
         try {
             runTask()
         } finally {
+            liveNotificationIds.remove(taskId.hashCode())
             RunHandoff.endTurn(taskId, turn)
         }
         hasDeliveredResult = true
@@ -531,7 +562,9 @@ open class TaskRunner(
                 notificationConfig = context.notificationConfig
                 notificationConfigJsonString = if (notificationConfig != null) bdJson.encodeToString<NotificationConfig>(notificationConfig!!) else null
 
-                canRunInForeground = runInForegroundFileSize >= 0 &&
+                // Plezy Vex fork: a non-pausable task (a live server transcode) cannot
+                // survive the 9-minute timeout's pause/resume, so it may always go foreground.
+                canRunInForeground = (runInForegroundFileSize >= 0 || !task.allowPause) &&
                         notificationConfig?.running != null // must have notification
                 isResume = determineIfResume()
                 Log.i(
@@ -565,6 +598,8 @@ open class TaskRunner(
                                 "Task ${task.taskId} was stopped by the system (stop reason " +
                                         "${context.platformStopReason}) and will run again"
                             )
+                            // Plezy Vex fork: nothing runs until then
+                            NotificationService.removeNotification(context)
                             return@withContext
                         }
                         Log.w(TAG, "Task ${task.taskId} was stopped by the system and could not be enqueued again")
@@ -584,6 +619,10 @@ open class TaskRunner(
                     if (status != TaskStatus.failed || task.retriesRemaining == 0) {
                         // update only if not failed, or no retries remaining
                         context.updateNotification(task, status)
+                    } else if (!task.allowPause) {
+                        // Plezy Vex fork: a transcode's retry starts over and posts its own
+                        // notification; until then nothing runs
+                        NotificationService.removeNotification(context)
                     }
                     if (status != TaskStatus.canceled) {
                         // let the holdingQueue know this task is no longer active
@@ -698,7 +737,7 @@ open class TaskRunner(
                 Log.i(TAG, "Task ${task.taskId} was paused, ignoring exception: ${e.message}")
                 return TaskStatus.paused
             }
-            if (isTimedOut && !runInForeground) {
+            if (isTimedOut && !runInForeground && task.allowPause) {
                 Log.i(TAG, "Task ${task.taskId} timed out, ignoring exception: ${e.message}")
                 return TaskStatus.enqueued
             }
@@ -821,6 +860,8 @@ open class TaskRunner(
                                 )
                             ) {
                                 updateProgressAndNotify(progress, expectedFileSize, task)
+                            } else if (contentLength <= 0 && !task.allowPause) {
+                                refreshUnknownLengthRun(task) // Plezy Vex fork
                             }
                         }
                         doneCompleter.complete(TaskStatus.complete)
@@ -845,7 +886,9 @@ open class TaskRunner(
                             doneCompleter.complete(TaskStatus.paused)
                             break
                         }
-                        if (isTimedOut && !runInForeground) {
+                        // Plezy Vex fork: pausing is how a timed-out run continues, so a task
+                        // that cannot pause runs until the platform itself stops the run
+                        if (isTimedOut && !runInForeground && task.allowPause) {
                             activeConnection?.disconnect()
                             // special use of .enqueued status, see [processDownload]
                             doneCompleter.complete(TaskStatus.enqueued)
@@ -864,6 +907,31 @@ open class TaskRunner(
                 testerJob?.cancelAndJoin()
             }
         }
+    }
+
+    // Plezy Vex fork: next time a running unknown-length, non-pausable task refreshes
+    private var nextUnknownLengthRefresh = 0L
+
+    /**
+     * Plezy Vex fork: an unknown-length transfer sends no progress, so its notification would
+     * never be refreshed. Refresh it every minute: that keeps its timeout (see
+     * [NotificationService.updateNotification]) from removing it while the run is alive, and
+     * promotes a run started in the background to the foreground once the app is visible
+     * again (see [foregroundStartAllowed]).
+     */
+    private suspend fun refreshUnknownLengthRun(task: Task) {
+        val now = currentTimeMillis()
+        if (nextUnknownLengthRefresh == 0L) {
+            nextUnknownLengthRefresh = now + unknownLengthRefreshMillis
+            return
+        }
+        if (now < nextUnknownLengthRefresh) return
+        nextUnknownLengthRefresh = now + unknownLengthRefreshMillis
+        if (!runInForeground && canRunInForeground) {
+            determineRunInForeground(task, -1) // posts the notification if it goes foreground
+            if (runInForeground) return
+        }
+        context.updateNotification(task, TaskStatus.running)
     }
 
     /**
@@ -931,8 +999,10 @@ open class TaskRunner(
      */
     fun determineRunInForeground(task: Task, contentLength: Long) {
         val wasRunInForeground = runInForeground
-        runInForeground =
-            canRunInForeground && contentLength > (runInForegroundFileSize.toLong() shl 20)
+        runInForeground = canRunInForeground && (
+            (!task.allowPause && contentLength < 0) || // Plezy Vex fork: unknown-length, non-resumable
+                (runInForegroundFileSize >= 0 && contentLength > (runInForegroundFileSize.toLong() shl 20))) &&
+                (context !is TaskWorker || foregroundStartAllowed(context.appContext)) // Plezy Vex fork
         if (runInForeground) {
             Log.i(TAG, "TaskId ${task.taskId} will run in foreground")
             if (!wasRunInForeground) {

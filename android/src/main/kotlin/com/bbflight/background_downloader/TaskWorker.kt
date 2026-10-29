@@ -1,7 +1,9 @@
 package com.bbflight.background_downloader
 
 import android.annotation.SuppressLint
+import android.app.ForegroundServiceStartNotAllowedException
 import android.app.Notification
+import android.os.Build
 import android.content.Context
 import android.content.SharedPreferences
 import androidx.preference.PreferenceManager
@@ -130,6 +132,12 @@ open class TaskWorker(
         try {
             setForeground(ForegroundInfo(notificationId, notification, notificationType))
         } catch (e: IllegalStateException) {
+            // Plezy Vex fork: Android 12+ refuses a foreground service started from the
+            // background. That is not a completed worker: report it, so the run is not
+            // treated as foreground (and the notification is posted normally)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+                e is ForegroundServiceStartNotAllowedException
+            ) throw e
             Log.d("TaskWorker", "Ignoring setForeground: worker already completed. ${e.message}")
         }
     }

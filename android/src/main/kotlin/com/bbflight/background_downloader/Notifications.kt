@@ -2,6 +2,7 @@ package com.bbflight.background_downloader
 
 import android.annotation.SuppressLint
 import android.app.ForegroundServiceStartNotAllowedException
+import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
@@ -10,6 +11,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+import android.graphics.drawable.Icon
 import android.os.Build
 import android.os.Bundle
 import android.util.Log
@@ -392,6 +394,41 @@ object NotificationService {
     private const val MIN_NOTIFICATION_INTERVAL_MS = 300L
 
     /**
+     * Plezy Vex fork: remove the notification of [taskWorker]'s task, whose run ended without
+     * a final status (the platform stopped it and runs it again later)
+     */
+    suspend fun removeNotification(taskWorker: TaskJobContext) {
+        if (taskWorker.notificationConfig?.groupNotificationId?.isNotEmpty() == true) return
+        taskWorker.notificationId = taskWorker.task.taskId.hashCode()
+        addToNotificationQueue(taskWorker)
+    }
+
+    /**
+     * Plezy Vex fork: remove running notifications that no run in this process owns. A run
+     * that ended without a final update (a dead process, or a release before running
+     * notifications had a timeout) leaves its notification showing progress forever.
+     */
+    fun removeOrphanedRunningNotifications(context: Context) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) return
+        val manager = context.getSystemService(NotificationManager::class.java) ?: return
+        val runningIcons = setOf(R.drawable.outline_file_download_24, R.drawable.outline_file_upload_24)
+        try {
+            for (sbn in manager.activeNotifications) {
+                val notification = sbn.notification
+                if (notification.channelId != notificationChannelId) continue
+                if (notification.flags and Notification.FLAG_FOREGROUND_SERVICE != 0) continue
+                val icon = notification.smallIcon ?: continue
+                if (icon.type != Icon.TYPE_RESOURCE || icon.resId !in runningIcons) continue
+                if (TaskRunner.liveNotificationIds.contains(sbn.id)) continue
+                Log.i(TAG, "Removing orphaned running notification ${sbn.id}")
+                manager.cancel(sbn.tag, sbn.id)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not check for orphaned notifications: $e")
+        }
+    }
+
+    /**
      * Starts listening to the queue and processes each item
      *
      * Each item is a NotificationData object that represents a
@@ -545,6 +582,12 @@ object NotificationService {
             builder.setWhen(taskWorker.task.creationTime)
                 .setSortKey(taskWorker.task.taskId)
                 .setOnlyAlertOnce(true)
+            // Plezy Vex fork: a non-pausable run (a live transcode) refreshes this notification
+            // every minute while alive, so it can never outlast a run that ended without a
+            // final update (the system stopped it, or the process died)
+            if (!taskWorker.task.allowPause) {
+                builder.setTimeoutAfter(TaskRunner.unknownLengthNotificationTimeoutMillis)
+            }
         }
         // use stored progress if notificationType is .paused
         taskWorker.notificationProgress =
