@@ -531,7 +531,9 @@ open class TaskRunner(
                 notificationConfig = context.notificationConfig
                 notificationConfigJsonString = if (notificationConfig != null) bdJson.encodeToString<NotificationConfig>(notificationConfig!!) else null
 
-                canRunInForeground = runInForegroundFileSize >= 0 &&
+                // Plezy Vex fork: a non-pausable task (a live server transcode) cannot
+                // survive the 9-minute timeout's pause/resume, so it may always go foreground.
+                canRunInForeground = (runInForegroundFileSize >= 0 || !task.allowPause) &&
                         notificationConfig?.running != null // must have notification
                 isResume = determineIfResume()
                 Log.i(
@@ -931,8 +933,9 @@ open class TaskRunner(
      */
     fun determineRunInForeground(task: Task, contentLength: Long) {
         val wasRunInForeground = runInForeground
-        runInForeground =
-            canRunInForeground && contentLength > (runInForegroundFileSize.toLong() shl 20)
+        runInForeground = canRunInForeground && (
+            (!task.allowPause && contentLength < 0) || // Plezy Vex fork: unknown-length, non-resumable
+                (runInForegroundFileSize >= 0 && contentLength > (runInForegroundFileSize.toLong() shl 20)))
         if (runInForeground) {
             Log.i(TAG, "TaskId ${task.taskId} will run in foreground")
             if (!wasRunInForeground) {
