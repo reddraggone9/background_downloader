@@ -370,7 +370,7 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
 
         /**
          * NetworkRequest for a task that requires Wi-Fi (API 28+): internet over
-         * Wi-Fi or Ethernet.
+         * an unmetered network (Wi-Fi or Ethernet that is not a metered hotspot).
          *
          * JobScheduler matches the request against the app's default network.
          * [NetworkRequest.Builder] starts with NOT_VPN and NOT_RESTRICTED, so with
@@ -384,8 +384,9 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
                 .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
                 .removeCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
                 .removeCapability(NetworkCapabilities.NET_CAPABILITY_NOT_RESTRICTED)
-                .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
-                .addTransportType(NetworkCapabilities.TRANSPORT_ETHERNET)
+                // Plezy Vex fork: "Wi-Fi only" means unmetered. A phone hotspot is Wi-Fi
+                // but metered, and must not count; this matches NetworkType.UNMETERED.
+                .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)
                 .build()
 
         /**

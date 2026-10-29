@@ -25,10 +25,8 @@ class WifiNetworkRequestTest {
     }
 
     @Test
-    fun wifiTaskRunsOnWifiOrEthernetButNotCellular() {
+    fun wifiTaskRunsOnlyOnUnmeteredNetworks() {
         assertTrue(request.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET))
-        assertTrue(request.hasTransport(NetworkCapabilities.TRANSPORT_WIFI))
-        assertTrue(request.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET))
-        assertFalse(request.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR))
+        assertTrue(request.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED))
     }
 }
